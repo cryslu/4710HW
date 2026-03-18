@@ -29,7 +29,22 @@ module RegFile (
   logic [`REG_SIZE] regs[NumRegs];
 
   // TODO: your code here
+  // combinational reads: 
+  // need to guard register 0
+  assign rs1_data = (rs1 == 5'd0) ? '0 : regs[rs1]; 
+  assign rs2_data = (rs2 == 5'd0) ? '0 : regs[rs2]; 
 
+  // sequential writes: 
+  always_ff @(posedge clk) begin
+    // reset all registers to 0:
+    if (rst) begin 
+      for (int i = 0; i < NumRegs; i++) begin 
+        regs[i] <= '0; // non-blocking assignment 
+      end 
+    end else if (we && rd != 5'd0) begin 
+      regs[rd] <= rd_data; 
+    end 
+  end 
 endmodule
 
 module DatapathSingleCycle (
@@ -201,25 +216,319 @@ module DatapathSingleCycle (
   // TODO: you will need to edit the port connections, however.
   wire [`REG_SIZE] rs1_data;
   wire [`REG_SIZE] rs2_data;
+  logic [`REG_SIZE] rd_data; 
+  logic we; 
   RegFile rf (
     .clk(clk),
     .rst(rst),
-    .we(1'b0),
-    .rd(0),
-    .rd_data(0),
-    .rs1(0),
-    .rs2(0),
+    .we(we),
+    .rd(insn_rd),
+    .rd_data(rd_data),
+    .rs1(insn_rs1),
+    .rs2(insn_rs2),
     .rs1_data(rs1_data),
     .rs2_data(rs2_data));
 
-  logic illegal_insn;
+  // CLA adder signals
+  logic [`REG_SIZE] cla_a, cla_b, cla_sum;
+  logic cla_cin;
+  
+  // Gate CLA to avoid unnecessary simulation
+  wire is_add_sub_addi = ((insn_opcode == OpRegImm) && (insn_funct3 == 3'b000)) ||  // addi
+                         ((insn_opcode == OpRegReg) && (insn_funct3 == 3'b000) && 
+                          (insn_funct7 == 7'd0 || insn_funct7 == 7'b0100000));      // add or sub
+  
+  CarryLookaheadAdder cla_inst (
+      .a(is_add_sub_addi ? cla_a : 32'd0),
+      .b(is_add_sub_addi ? cla_b : 32'd0),
+      .cin(is_add_sub_addi ? cla_cin : 1'b0),
+      .sum(cla_sum)
+  );
 
-  always_comb begin
+  // Divider signals (unsigned, from HW2A)
+  logic [`REG_SIZE] div_dividend, div_divisor;
+  logic [`REG_SIZE] div_quotient, div_remainder;
+  
+  // Gate divider to avoid unnecessary simulation when not doing div/rem
+  wire is_div_or_rem = (insn_opcode == OpRegReg) && (insn_funct7 == 7'd1) && 
+                       (insn_funct3[2]); // funct3[2]=1 covers 100,101,110,111 (div,divu,rem,remu)
+  
+  DividerUnsigned divider_inst (
+      .i_dividend(is_div_or_rem ? div_dividend : 32'd0),
+      .i_divisor(is_div_or_rem ? div_divisor : 32'd1),
+      .o_quotient(div_quotient),
+      .o_remainder(div_remainder)
+  );
+
+  logic [`REG_SIZE] load_addr, store_addr;  // temp wires for memory address alignment
+  logic illegal_insn; 
+  // order doesn't matter in combinational block:
+  always_comb begin 
     illegal_insn = 1'b0;
+    halt         = 1'b0;
+
+    // defaults - prevent latch inference
+    pcNext             = pcCurrent + 32'd4;
+    rd_data            = 32'd0;
+    we                 = 1'b0;
+
+    // CLA defaults
+    cla_a              = 32'd0;
+    cla_b              = 32'd0;
+    cla_cin            = 1'b0;
+
+    // divider defaults - gate to prevent unnecessary computation
+    div_dividend       = 32'd0;
+    div_divisor        = 32'd1;  // non-zero to avoid divide-by-zero logic
+
+    // memory address temp wires defaults
+    load_addr          = 32'd0;
+    store_addr         = 32'd0;
+
+    // memory defaults
+    addr_to_dmem       = 32'd0;
+    store_data_to_dmem = 32'd0;
+    store_we_to_dmem   = 4'b0000;
+
+    // trace outputs
+    trace_completed_pc           = pcCurrent;
+    trace_completed_insn         = insn_from_imem;
+    trace_completed_cycle_status = CYCLE_NO_STALL;
 
     case (insn_opcode)
       OpLui: begin
-        // TODO: start here by implementing lui
+        rd_data = {insn_from_imem[31:12], 12'b0}; // upper 20 bits
+        we = 1'b1; // so we can write to rd
+      end
+      OpAuipc: begin 
+        rd_data = pcCurrent + {insn_from_imem[31:12], 12'b0}; 
+        we = 1'b1; 
+      end 
+      OpRegImm: begin 
+        we = 1'b1; 
+        case (insn_funct3) 
+          3'b000: begin // addi - use CLA
+            cla_a   = rs1_data;
+            cla_b   = imm_i_sext;
+            cla_cin = 1'b0;
+            rd_data = cla_sum;
+          end
+          3'b010: rd_data = ($signed(rs1_data) < $signed(imm_i_sext)) ? 32'd1 : 32'd0; // slti
+          3'b011: rd_data = (rs1_data < imm_i_sext) ? 32'd1 : 32'd0;                   // sltiu
+          3'b100: rd_data = rs1_data ^ imm_i_sext;                                       // xori
+          3'b110: rd_data = rs1_data | imm_i_sext;                                       // ori
+          3'b111: rd_data = rs1_data & imm_i_sext;                                       // andi
+          3'b001: rd_data = rs1_data << imm_shamt;                                       // slli
+          3'b101: begin // srli or srai
+            if (insn_funct7 == 7'b0000000) begin 
+              rd_data = rs1_data >> imm_shamt;              // srli
+            end else begin 
+              rd_data = $signed(rs1_data) >>> imm_shamt;   // srai
+            end 
+          end 
+          default: illegal_insn = 1'b1;
+        endcase 
+      end
+      OpRegReg: begin
+        we = 1'b1;
+        case (insn_funct3)
+          3'b000: begin
+            if (insn_funct7 == 7'd1) begin // mul
+              rd_data = rs1_data * rs2_data;
+            end else if (insn_funct7 == 7'd0) begin // add - use CLA
+              cla_a   = rs1_data;
+              cla_b   = rs2_data;
+              cla_cin = 1'b0;
+              rd_data = cla_sum;
+            end else begin // sub - CLA with two's complement
+              cla_a   = rs1_data;
+              cla_b   = ~rs2_data;
+              cla_cin = 1'b1;
+              rd_data = cla_sum;
+            end
+          end
+          3'b001: begin
+            if (insn_funct7 == 7'd1) begin // mulh - signed x signed, upper 32 bits
+              rd_data = 32'($signed(($signed({{32{rs1_data[31]}}, rs1_data}) *
+                         $signed({{32{rs2_data[31]}}, rs2_data}))) >>> 32);
+            end else begin // sll
+              rd_data = rs1_data << rs2_data[4:0];
+            end
+          end
+          3'b010: begin
+            if (insn_funct7 == 7'd1) begin // mulhsu - signed x unsigned, upper 32 bits
+              rd_data = 32'($signed(($signed({{32{rs1_data[31]}}, rs1_data}) *
+                         {32'd0, rs2_data})) >>> 32);
+            end else begin // slt
+              rd_data = ($signed(rs1_data) < $signed(rs2_data)) ? 32'd1 : 32'd0;
+            end
+          end
+          3'b011: begin
+            if (insn_funct7 == 7'd1) begin // mulhu - unsigned x unsigned, upper 32 bits
+              rd_data = 32'(({32'd0, rs1_data} * {32'd0, rs2_data}) >> 32);
+            end else begin // sltu
+              rd_data = (rs1_data < rs2_data) ? 32'd1 : 32'd0;
+            end
+          end
+          3'b100: begin
+            if (insn_funct7 == 7'd1) begin // div - signed
+              if (rs2_data == 32'd0)
+                rd_data = 32'hFFFFFFFF;                        // div by zero per spec
+              else if (rs1_data == 32'h80000000 && rs2_data == 32'hFFFFFFFF)
+                rd_data = 32'h80000000;                        // overflow per spec
+              else begin
+                div_dividend = rs1_data[31] ? (~rs1_data + 32'd1) : rs1_data;
+                div_divisor  = rs2_data[31] ? (~rs2_data + 32'd1) : rs2_data;
+                rd_data      = (rs1_data[31] ^ rs2_data[31]) ? (~div_quotient + 32'd1) : div_quotient;
+              end
+            end else begin // xor
+              rd_data = rs1_data ^ rs2_data;
+            end
+          end
+          3'b101: begin
+            if (insn_funct7 == 7'd1) begin // divu - unsigned
+              if (rs2_data == 32'd0)
+                rd_data = 32'hFFFFFFFF;                        // div by zero per spec
+              else begin
+                div_dividend = rs1_data;
+                div_divisor  = rs2_data;
+                rd_data      = div_quotient;
+              end
+            end else if (insn_funct7 == 7'b0000000) begin // srl
+              rd_data = rs1_data >> rs2_data[4:0];
+            end else begin // sra
+              rd_data = $signed(rs1_data) >>> rs2_data[4:0];
+            end
+          end
+          3'b110: begin
+            if (insn_funct7 == 7'd1) begin // rem - signed
+              if (rs2_data == 32'd0)
+                rd_data = rs1_data;                            // dividend per spec
+              else if (rs1_data == 32'h80000000 && rs2_data == 32'hFFFFFFFF)
+                rd_data = 32'd0;                               // overflow per spec
+              else begin
+                div_dividend = rs1_data[31] ? (~rs1_data + 32'd1) : rs1_data;
+                div_divisor  = rs2_data[31] ? (~rs2_data + 32'd1) : rs2_data;
+                rd_data      = rs1_data[31] ? (~div_remainder + 32'd1) : div_remainder;
+              end
+            end else begin // or
+              rd_data = rs1_data | rs2_data;
+            end
+          end
+          3'b111: begin
+            if (insn_funct7 == 7'd1) begin // remu - unsigned
+              if (rs2_data == 32'd0)
+                rd_data = rs1_data;                            // per spec
+              else begin
+                div_dividend = rs1_data;
+                div_divisor  = rs2_data;
+                rd_data      = div_remainder;
+              end
+            end else begin // and
+              rd_data = rs1_data & rs2_data;
+            end
+          end
+          default: illegal_insn = 1'b1;
+        endcase
+      end
+      OpBranch: begin
+        // branches never write to rd; pcNext stays +4 if condition false
+        case (insn_funct3)
+          3'b000: if (rs1_data == rs2_data)                       pcNext = pcCurrent + imm_b_sext; // beq
+          3'b001: if (rs1_data != rs2_data)                       pcNext = pcCurrent + imm_b_sext; // bne
+          3'b100: if ($signed(rs1_data) < $signed(rs2_data))     pcNext = pcCurrent + imm_b_sext; // blt
+          3'b101: if ($signed(rs1_data) >= $signed(rs2_data))    pcNext = pcCurrent + imm_b_sext; // bge
+          3'b110: if (rs1_data < rs2_data)                        pcNext = pcCurrent + imm_b_sext; // bltu
+          3'b111: if (rs1_data >= rs2_data)                       pcNext = pcCurrent + imm_b_sext; // bgeu
+          default: illegal_insn = 1'b1;
+        endcase
+      end
+      OpJal: begin
+        rd_data = pcCurrent + 32'd4;  // save return address
+        we      = 1'b1;
+        pcNext  = pcCurrent + imm_j_sext;
+      end
+      OpJalr: begin
+        rd_data = pcCurrent + 32'd4;                      // save return address
+        we      = 1'b1;
+        pcNext  = (rs1_data + imm_i_sext) & ~32'd1;      // clear lowest bit per spec
+      end
+      OpLoad: begin
+        we = 1'b1;
+        // compute address, align to 4-byte boundary for memory
+        load_addr = rs1_data + imm_i_sext;
+        addr_to_dmem = {load_addr[31:2], 2'b00};
+        case (insn_funct3)
+          3'b000: begin // lb - select byte based on lower 2 bits of address
+            case (load_addr[1:0])
+              2'b00: rd_data = {{24{load_data_from_dmem[7]}},  load_data_from_dmem[7:0]};
+              2'b01: rd_data = {{24{load_data_from_dmem[15]}}, load_data_from_dmem[15:8]};
+              2'b10: rd_data = {{24{load_data_from_dmem[23]}}, load_data_from_dmem[23:16]};
+              2'b11: rd_data = {{24{load_data_from_dmem[31]}}, load_data_from_dmem[31:24]};
+              default: rd_data = 32'd0;
+            endcase
+          end
+          3'b001: begin // lh - select halfword based on bit 1 of address
+            case (load_addr[1])
+              1'b0: rd_data = {{16{load_data_from_dmem[15]}}, load_data_from_dmem[15:0]};
+              1'b1: rd_data = {{16{load_data_from_dmem[31]}}, load_data_from_dmem[31:16]};
+              default: rd_data = 32'd0;
+            endcase
+          end
+          3'b010: rd_data = load_data_from_dmem;                                           // lw
+          3'b100: begin // lbu - zero extend
+            case (load_addr[1:0])
+              2'b00: rd_data = {24'd0, load_data_from_dmem[7:0]};
+              2'b01: rd_data = {24'd0, load_data_from_dmem[15:8]};
+              2'b10: rd_data = {24'd0, load_data_from_dmem[23:16]};
+              2'b11: rd_data = {24'd0, load_data_from_dmem[31:24]};
+              default: rd_data = 32'd0;
+            endcase
+          end
+          3'b101: begin // lhu - zero extend
+            case (load_addr[1])
+              1'b0: rd_data = {16'd0, load_data_from_dmem[15:0]};
+              1'b1: rd_data = {16'd0, load_data_from_dmem[31:16]};
+              default: rd_data = 32'd0;
+            endcase
+          end
+          default: illegal_insn = 1'b1;
+        endcase
+      end
+      OpStore: begin
+        // compute address, align to 4-byte boundary for memory
+        store_addr = rs1_data + imm_s_sext;
+        addr_to_dmem = {store_addr[31:2], 2'b00};
+        case (insn_funct3)
+          3'b000: begin // sb - write enable for correct byte lane
+            case (store_addr[1:0])
+              2'b00: begin store_data_to_dmem = {24'd0, rs2_data[7:0]};        store_we_to_dmem = 4'b0001; end
+              2'b01: begin store_data_to_dmem = {16'd0, rs2_data[7:0], 8'd0};  store_we_to_dmem = 4'b0010; end
+              2'b10: begin store_data_to_dmem = {8'd0, rs2_data[7:0], 16'd0};  store_we_to_dmem = 4'b0100; end
+              2'b11: begin store_data_to_dmem = {rs2_data[7:0], 24'd0};        store_we_to_dmem = 4'b1000; end
+              default: store_we_to_dmem = 4'b0000;
+            endcase
+          end
+          3'b001: begin // sh - write enable for correct halfword lane
+            case (store_addr[1])
+              1'b0: begin store_data_to_dmem = {16'd0, rs2_data[15:0]};        store_we_to_dmem = 4'b0011; end
+              1'b1: begin store_data_to_dmem = {rs2_data[15:0], 16'd0};        store_we_to_dmem = 4'b1100; end
+              default: store_we_to_dmem = 4'b0000;
+            endcase
+          end
+          3'b010: begin // sw
+            store_data_to_dmem = rs2_data;
+            store_we_to_dmem   = 4'b1111;
+          end
+          default: illegal_insn = 1'b1;
+        endcase
+      end
+      OpEnviron: begin
+        if (insn_ecall)
+          halt = 1'b1;
+      end
+      OpMiscMem: begin
+        // fence: treat as nop, PC advances by default
       end
       default: begin
         illegal_insn = 1'b1;
