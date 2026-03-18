@@ -166,7 +166,7 @@ module DatapathMultiCycle (
                    (insn_funct3[2] == 1'b1);
 
   logic [3:0] div_cycle_count;
-  wire div_stall = is_divide && (div_cycle_count != 4'd7);
+  wire div_stall = is_divide && (div_cycle_count != 4'd8);
 
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -271,7 +271,7 @@ module DatapathMultiCycle (
 
     trace_completed_pc           = pcCurrent;
     trace_completed_insn         = insn_from_imem;
-    trace_completed_cycle_status = is_divide ? CYCLE_DIV : CYCLE_NO_STALL;
+    trace_completed_cycle_status = div_stall ? CYCLE_DIV : CYCLE_NO_STALL;
 
     case (insn_opcode)
       OpLui: begin
