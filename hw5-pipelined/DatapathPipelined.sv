@@ -50,7 +50,6 @@ module RegFile (
   localparam int NumRegs = 32;
   logic [`REG_SIZE] regs[NumRegs];
 
-  // WD bypass: if WB is writing the register being read, forward it immediately
   assign rs1_data = (rs1 == 5'd0)                   ? '0 :
                     (we && rd == rs1 && rd != 5'd0)  ? rd_data :
                     regs[rs1];
@@ -143,7 +142,6 @@ module DatapathPipelined (
   localparam bit [`OPCODE_SIZE] OpcodeAuipc   = 7'b00_101_11;
   localparam bit [`OPCODE_SIZE] OpcodeLui     = 7'b01_101_11;
 
-  // cycle counter — do not rename, testbench uses this
   logic [`REG_SIZE] cycles_current;
   always_ff @(posedge clk) begin
     if (rst) cycles_current <= 0;
@@ -151,22 +149,23 @@ module DatapathPipelined (
   end
 
   // =============================================================
-  //  FETCH STAGE
+  //  FETCH
   // =============================================================
   logic [`REG_SIZE]  f_pc_current;
   wire  [`INSN_SIZE] f_insn;
   cycle_status_e     f_cycle_status;
 
-  // Redirect from Execute (combinational, set below)
-  logic        x_redirect_valid;
+  logic             x_redirect_valid;
   logic [`REG_SIZE] x_redirect_pc;
 
-  // Stall / flush signals (set below after EX)
-  logic stall_f, stall_d, flush_d, flush_x;
+  logic stall_f, stall_d, flush_d, flush_x, load_use_bubble;
+
+  // div_stall forward declaration (wire, driven from always_comb below)
+  logic div_stall;
 
   always_ff @(posedge clk) begin
     if (rst) begin
-      f_pc_current  <= 32'd0;
+      f_pc_current   <= 32'd0;
       f_cycle_status <= CYCLE_NO_STALL;
     end else if (!stall_f) begin
       f_cycle_status <= CYCLE_NO_STALL;
@@ -177,42 +176,36 @@ module DatapathPipelined (
     end
   end
   assign pc_to_imem = f_pc_current;
-  // Memory reads on negedge; insn_from_imem is ready before the next posedge
-  assign f_insn = insn_from_imem;
+  assign f_insn     = insn_from_imem;
 
   wire [255:0] f_disasm;
   Disasm #(.PREFIX("F")) disasm_0fetch (.insn(f_insn), .disasm(f_disasm));
 
   // =============================================================
-  //  DECODE STAGE
+  //  DECODE
   // =============================================================
   stage_decode_t decode_state;
   always_ff @(posedge clk) begin
-    if (rst) begin
+    if (rst)
       decode_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_RESET};
-    end else if (flush_d) begin
+    else if (flush_d)
       decode_state <= '{pc: 0, insn: 0, cycle_status: CYCLE_TAKEN_BRANCH};
-    end else if (!stall_d) begin
-      decode_state <= '{
-        pc:           f_pc_current,
-        insn:         f_insn,
-        cycle_status: f_cycle_status
-      };
-    end
+    else if (!stall_d)
+      decode_state <= '{pc: f_pc_current, insn: f_insn, cycle_status: f_cycle_status};
+    // stall_d: hold
   end
 
   wire [255:0] d_disasm;
   Disasm #(.PREFIX("D")) disasm_1decode (.insn(decode_state.insn), .disasm(d_disasm));
 
-  // Decode fields
-  wire [ 6:0] d_funct7   = decode_state.insn[31:25];
-  wire [ 4:0] d_rs2      = decode_state.insn[24:20];
-  wire [ 4:0] d_rs1      = decode_state.insn[19:15];
-  wire [ 2:0] d_funct3   = decode_state.insn[14:12];
-  wire [ 4:0] d_rd       = decode_state.insn[11: 7];
+  wire [ 6:0] d_funct7    = decode_state.insn[31:25];
+  wire [ 4:0] d_rs2       = decode_state.insn[24:20];
+  wire [ 4:0] d_rs1       = decode_state.insn[19:15];
+  wire [ 2:0] d_funct3    = decode_state.insn[14:12];
+  wire [ 4:0] d_rd        = decode_state.insn[11: 7];
   wire [`OPCODE_SIZE] d_opcode = decode_state.insn[6:0];
 
-  wire [11:0] d_imm_i    = decode_state.insn[31:20];
+  wire [11:0] d_imm_i     = decode_state.insn[31:20];
   wire [ 4:0] d_imm_shamt = decode_state.insn[24:20];
 
   wire [11:0] d_imm_s;
@@ -232,12 +225,10 @@ module DatapathPipelined (
   wire [`REG_SIZE] d_imm_b_sext = {{19{d_imm_b[12]}}, d_imm_b};
   wire [`REG_SIZE] d_imm_j_sext = {{11{d_imm_j[20]}}, d_imm_j};
 
-  // WB signals (forward declared)
   wire        wb_rf_we;
   wire [ 4:0] wb_rd;
   wire [`REG_SIZE] wb_rd_data;
 
-  // Register file — MUST be named `rf`
   wire [`REG_SIZE] d_rs1_data, d_rs2_data;
   RegFile rf (
       .clk(clk), .rst(rst),
@@ -247,56 +238,36 @@ module DatapathPipelined (
   );
 
   // =============================================================
-  //  EXECUTE STAGE
+  //  EXECUTE
   // =============================================================
-  stage_execute_t execute_state;
-  always_ff @(posedge clk) begin
-    if (rst) begin
-      execute_state <= '{
-        pc: 0, insn: 0, cycle_status: CYCLE_RESET,
-        rs1_data: 0, rs2_data: 0, rs1: 0, rs2: 0, rd: 0,
-        imm_i_sext: 0, imm_s_sext: 0, imm_b_sext: 0, imm_j_sext: 0,
-        imm_shamt: 0
-      };
-    end else if (flush_x) begin
-      execute_state <= '{
-        pc: 0, insn: 0, cycle_status: CYCLE_TAKEN_BRANCH,
-        rs1_data: 0, rs2_data: 0, rs1: 0, rs2: 0, rd: 0,
-        imm_i_sext: 0, imm_s_sext: 0, imm_b_sext: 0, imm_j_sext: 0,
-        imm_shamt: 0
-      };
-    end else begin
-      execute_state <= '{
-        pc:           decode_state.pc,
-        insn:         decode_state.insn,
-        cycle_status: decode_state.cycle_status,
-        rs1_data:     d_rs1_data,
-        rs2_data:     d_rs2_data,
-        rs1:          d_rs1,
-        rs2:          d_rs2,
-        rd:           d_rd,
-        imm_i_sext:   d_imm_i_sext,
-        imm_s_sext:   d_imm_s_sext,
-        imm_b_sext:   d_imm_b_sext,
-        imm_j_sext:   d_imm_j_sext,
-        imm_shamt:    d_imm_shamt
-      };
-    end
-  end
 
-  wire [255:0] x_disasm;
-  Disasm #(.PREFIX("X")) disasm_2execute (.insn(execute_state.insn), .disasm(x_disasm));
+  stage_execute_t execute_state;
 
   wire [`OPCODE_SIZE] x_opcode = execute_state.insn[6:0];
   wire [ 6:0]         x_funct7 = execute_state.insn[31:25];
   wire [ 2:0]         x_funct3 = execute_state.insn[14:12];
 
-  // ---- MEM/WB bypass source declarations (defined after MEM stage) ----
+  wire x_is_divide = (x_opcode == OpcodeRegReg) &&
+                     (x_funct7 == 7'd1) &&
+                     (x_funct3[2] == 1'b1);
+
+  logic [6:0] div_pipe_valid;
+
+  always_comb div_stall = x_is_divide && !div_pipe_valid[6];
+
+  always_ff @(posedge clk) begin
+    if (rst || !x_is_divide)
+      div_pipe_valid <= 7'd0;
+    else
+      div_pipe_valid <= {div_pipe_valid[5:0], 1'b1};
+  end
+
+  // -- MEM/WB bypass forward declarations --
   wire        m_rf_we;
   wire [ 4:0] m_rd;
-  wire [`REG_SIZE] m_alu_result;  // MX bypass value
+  wire [`REG_SIZE] m_alu_result;
 
-  // ---- MX and WX bypass muxes ----
+  // -- Forwarding muxes (MX > WX) --
   logic [`REG_SIZE] x_rs1_fwd, x_rs2_fwd;
   always_comb begin
     if (m_rf_we && m_rd != 5'd0 && m_rd == execute_state.rs1)
@@ -314,38 +285,60 @@ module DatapathPipelined (
       x_rs2_fwd = execute_state.rs2_data;
   end
 
-  // ---- CLA adder ----
+  // -- Divider operands: combinational input with latched fallback --
+  logic [`REG_SIZE] div_op_a_reg, div_op_b_reg;
+  logic             div_rs1_neg, div_rs2_neg;
+  logic             div_rs2_zero;
+  logic [`REG_SIZE] div_rs1_orig;
+  logic             div_ops_latched;
+
+  wire div_is_signed = (x_funct3[1:0] == 2'b00 || x_funct3[1:0] == 2'b10);
+
+  wire [`REG_SIZE] div_op_a_fresh = div_is_signed ?
+      (x_rs1_fwd[31] ? (~x_rs1_fwd + 32'd1) : x_rs1_fwd) : x_rs1_fwd;
+  wire [`REG_SIZE] div_op_b_fresh = div_is_signed ?
+      (x_rs2_fwd[31] ? (~x_rs2_fwd + 32'd1) : x_rs2_fwd) : x_rs2_fwd;
+
+  wire [`REG_SIZE] div_op_a = div_ops_latched ? div_op_a_reg : div_op_a_fresh;
+  wire [`REG_SIZE] div_op_b = div_ops_latched ? div_op_b_reg : div_op_b_fresh;
+
+  always_ff @(posedge clk) begin
+    if (rst || !x_is_divide || !div_stall) begin
+      div_op_a_reg    <= '0;
+      div_op_b_reg    <= '0;
+      div_rs1_neg     <= 1'b0;
+      div_rs2_neg     <= 1'b0;
+      div_rs2_zero    <= 1'b0;
+      div_rs1_orig    <= '0;
+      div_ops_latched <= 1'b0;
+    end else if (!div_ops_latched) begin
+      div_op_a_reg    <= div_op_a_fresh;
+      div_op_b_reg    <= div_op_b_fresh;
+      div_rs1_neg     <= x_rs1_fwd[31];
+      div_rs2_neg     <= x_rs2_fwd[31];
+      div_rs2_zero    <= (x_rs2_fwd == 32'd0);
+      div_rs1_orig    <= x_rs1_fwd;
+      div_ops_latched <= 1'b1;
+    end
+  end
+
+  wire [`REG_SIZE] div_quotient, div_remainder;
+  DividerUnsignedPipelined divider_inst (
+      .clk(clk), .rst(rst), .stall(1'b0),
+      .i_dividend(div_op_a),
+      .i_divisor (div_op_b),
+      .o_quotient(div_quotient),
+      .o_remainder(div_remainder)
+  );
+
+  // -- CLA adder --
   logic [`REG_SIZE] cla_a, cla_b, cla_sum;
   logic             cla_cin;
   CarryLookaheadAdder cla_inst (
       .a(cla_a), .b(cla_b), .cin(cla_cin), .sum(cla_sum)
   );
 
-  // ---- Pipelined divider ----
-  wire x_is_divide = (x_opcode == OpcodeRegReg) && (x_funct7 == 7'd1) &&
-                     (x_funct3[2] == 1'b1);
-
-  logic [3:0] div_cycle_count;
-  wire div_stall = x_is_divide && (div_cycle_count != 4'd7);
-
-  always_ff @(posedge clk) begin
-    if (rst) div_cycle_count <= 4'd0;
-    else if (x_is_divide) begin
-      if (div_cycle_count == 4'd8) div_cycle_count <= 4'd0;
-      else                         div_cycle_count <= div_cycle_count + 4'd1;
-    end else
-      div_cycle_count <= 4'd0;
-  end
-
-  logic [`REG_SIZE] div_dividend, div_divisor;
-  wire  [`REG_SIZE] div_quotient, div_remainder;
-  DividerUnsignedPipelined divider_inst (
-      .clk(clk), .rst(rst), .stall(1'b0),
-      .i_dividend(div_dividend), .i_divisor(div_divisor),
-      .o_quotient(div_quotient), .o_remainder(div_remainder)
-  );
-
-  // ---- Execute combinational ----
+  // -- Execute combinational --
   logic [`REG_SIZE] x_alu_result;
   logic             x_rf_we;
   logic             x_branch_taken;
@@ -355,21 +348,18 @@ module DatapathPipelined (
   cycle_status_e    x_cycle_status_out;
 
   always_comb begin
-    x_alu_result      = 32'd0;
-    x_rf_we           = 1'b0;
-    x_branch_taken    = 1'b0;
-    x_branch_target   = execute_state.pc + 32'd4;
-    x_halt            = 1'b0;
-    x_store_data      = x_rs2_fwd;
+    x_alu_result       = 32'd0;
+    x_rf_we            = 1'b0;
+    x_branch_taken     = 1'b0;
+    x_branch_target    = execute_state.pc + 32'd4;
+    x_halt             = 1'b0;
+    x_store_data       = x_rs2_fwd;
     x_cycle_status_out = execute_state.cycle_status;
 
-    cla_a        = 32'd0;
-    cla_b        = 32'd0;
-    cla_cin      = 1'b0;
-    div_dividend = 32'd0;
-    div_divisor  = 32'd1;
+    cla_a   = 32'd0;
+    cla_b   = 32'd0;
+    cla_cin = 1'b0;
 
-    // A div-stall cycle carries CYCLE_DIV regardless of the insn
     if (div_stall) x_cycle_status_out = CYCLE_DIV;
 
     case (x_opcode)
@@ -402,93 +392,117 @@ module DatapathPipelined (
         endcase
       end
       OpcodeRegReg: begin
-        x_rf_we = 1'b1;
         case (x_funct3)
           3'b000: begin
             if (x_funct7 == 7'd1) begin
               x_alu_result = x_rs1_fwd * x_rs2_fwd;
+              x_rf_we = 1'b1;
             end else if (x_funct7 == 7'd0) begin
               cla_a = x_rs1_fwd; cla_b = x_rs2_fwd; cla_cin = 1'b0;
               x_alu_result = cla_sum;
+              x_rf_we = 1'b1;
             end else begin
               cla_a = x_rs1_fwd; cla_b = ~x_rs2_fwd; cla_cin = 1'b1;
               x_alu_result = cla_sum;
+              x_rf_we = 1'b1;
             end
           end
           3'b001: begin
-            if (x_funct7 == 7'd1)
+            if (x_funct7 == 7'd1) begin
               x_alu_result = 32'($signed(($signed({{32{x_rs1_fwd[31]}}, x_rs1_fwd}) *
                              $signed({{32{x_rs2_fwd[31]}}, x_rs2_fwd}))) >>> 32);
-            else
+              x_rf_we = 1'b1;
+            end else begin
               x_alu_result = x_rs1_fwd << x_rs2_fwd[4:0];
+              x_rf_we = 1'b1;
+            end
           end
           3'b010: begin
-            if (x_funct7 == 7'd1)
+            if (x_funct7 == 7'd1) begin
               x_alu_result = 32'($signed(($signed({{32{x_rs1_fwd[31]}}, x_rs1_fwd}) *
                              {32'd0, x_rs2_fwd})) >>> 32);
-            else
+              x_rf_we = 1'b1;
+            end else begin
               x_alu_result = ($signed(x_rs1_fwd) < $signed(x_rs2_fwd)) ? 32'd1 : 32'd0;
+              x_rf_we = 1'b1;
+            end
           end
           3'b011: begin
-            if (x_funct7 == 7'd1)
+            if (x_funct7 == 7'd1) begin
               x_alu_result = 32'(({32'd0, x_rs1_fwd} * {32'd0, x_rs2_fwd}) >> 32);
-            else
+              x_rf_we = 1'b1;
+            end else begin
               x_alu_result = (x_rs1_fwd < x_rs2_fwd) ? 32'd1 : 32'd0;
+              x_rf_we = 1'b1;
+            end
           end
           3'b100: begin
             if (x_funct7 == 7'd1) begin
-              if (x_rs2_fwd == 32'd0)
-                x_alu_result = 32'hFFFFFFFF;
-              else if (x_rs1_fwd == 32'h80000000 && x_rs2_fwd == 32'hFFFFFFFF)
-                x_alu_result = 32'h80000000;
-              else begin
-                div_dividend = x_rs1_fwd[31] ? (~x_rs1_fwd + 32'd1) : x_rs1_fwd;
-                div_divisor  = x_rs2_fwd[31] ? (~x_rs2_fwd + 32'd1) : x_rs2_fwd;
-                x_alu_result = (x_rs1_fwd[31] ^ x_rs2_fwd[31]) ?
-                               (~div_quotient + 32'd1) : div_quotient;
+              // DIV (signed)
+              if (!div_stall) begin
+                if (div_rs2_zero)
+                  x_alu_result = 32'hFFFFFFFF;
+                else if (div_rs1_neg && div_op_a_reg == 32'h80000000 && div_op_b_reg == 32'h00000001)
+                  x_alu_result = 32'h80000000;
+                else
+                  x_alu_result = (div_rs1_neg ^ div_rs2_neg) ?
+                                 (~div_quotient + 32'd1) : div_quotient;
+                x_rf_we = 1'b1;
               end
-            end else
+            end else begin
               x_alu_result = x_rs1_fwd ^ x_rs2_fwd;
+              x_rf_we = 1'b1;
+            end
           end
           3'b101: begin
             if (x_funct7 == 7'd1) begin
-              if (x_rs2_fwd == 32'd0)
-                x_alu_result = 32'hFFFFFFFF;
-              else begin
-                div_dividend = x_rs1_fwd;
-                div_divisor  = x_rs2_fwd;
-                x_alu_result = div_quotient;
+              // DIVU (unsigned)
+              if (!div_stall) begin
+                if (div_rs2_zero)
+                  x_alu_result = 32'hFFFFFFFF;
+                else
+                  x_alu_result = div_quotient;
+                x_rf_we = 1'b1;
               end
-            end else if (x_funct7 == 7'b0000000)
+            end else if (x_funct7 == 7'b0000000) begin
               x_alu_result = x_rs1_fwd >> x_rs2_fwd[4:0];
-            else
+              x_rf_we = 1'b1;
+            end else begin
               x_alu_result = $signed(x_rs1_fwd) >>> x_rs2_fwd[4:0];
+              x_rf_we = 1'b1;
+            end
           end
           3'b110: begin
             if (x_funct7 == 7'd1) begin
-              if (x_rs2_fwd == 32'd0)
-                x_alu_result = x_rs1_fwd;
-              else if (x_rs1_fwd == 32'h80000000 && x_rs2_fwd == 32'hFFFFFFFF)
-                x_alu_result = 32'd0;
-              else begin
-                div_dividend = x_rs1_fwd[31] ? (~x_rs1_fwd + 32'd1) : x_rs1_fwd;
-                div_divisor  = x_rs2_fwd[31] ? (~x_rs2_fwd + 32'd1) : x_rs2_fwd;
-                x_alu_result = x_rs1_fwd[31] ? (~div_remainder + 32'd1) : div_remainder;
+              // REM (signed)
+              if (!div_stall) begin
+                if (div_rs2_zero)
+                  x_alu_result = div_rs1_orig;
+                else if (div_rs1_neg && div_op_a_reg == 32'h80000000 && div_op_b_reg == 32'h00000001)
+                  x_alu_result = 32'd0;
+                else
+                  x_alu_result = div_rs1_neg ? (~div_remainder + 32'd1) : div_remainder;
+                x_rf_we = 1'b1;
               end
-            end else
+            end else begin
               x_alu_result = x_rs1_fwd | x_rs2_fwd;
+              x_rf_we = 1'b1;
+            end
           end
           3'b111: begin
             if (x_funct7 == 7'd1) begin
-              if (x_rs2_fwd == 32'd0)
-                x_alu_result = x_rs1_fwd;
-              else begin
-                div_dividend = x_rs1_fwd;
-                div_divisor  = x_rs2_fwd;
-                x_alu_result = div_remainder;
+              // REMU (unsigned)
+              if (!div_stall) begin
+                if (div_rs2_zero)
+                  x_alu_result = div_rs1_orig;
+                else
+                  x_alu_result = div_remainder;
+                x_rf_we = 1'b1;
               end
-            end else
+            end else begin
               x_alu_result = x_rs1_fwd & x_rs2_fwd;
+              x_rf_we = 1'b1;
+            end
           end
           default: x_rf_we = 1'b0;
         endcase
@@ -535,33 +549,91 @@ module DatapathPipelined (
     endcase
   end
 
-  // Branch redirect — only fire when EX has a real (non-bubble) instruction
+  // Branch redirect
   assign x_redirect_valid = x_branch_taken && !div_stall &&
                              (execute_state.cycle_status == CYCLE_NO_STALL);
   assign x_redirect_pc    = x_branch_target;
 
-  // ---- Load-use hazard ----
-  wire x_is_load      = (x_opcode == OpcodeLoad);
-  wire load_use_stall = x_is_load && (execute_state.rd != 5'd0) &&
-                        ((execute_state.rd == d_rs1) || (execute_state.rd == d_rs2));
+  // -- Hazard detection --
+  wire x_is_load = (x_opcode == OpcodeLoad);
+  wire x_result_not_ready = x_is_load || div_stall;
 
-  // ---- Stall / flush control ----
-  // div_stall  → freeze F, D, X; bubble into X→M
-  // load_use   → freeze F, D; bubble into X (D insn re-issues next cycle)
-  // branch     → flush D and X (2 wrong-path insns)
+  wire d_uses_rs1 = (d_opcode != OpcodeLui) && (d_opcode != OpcodeAuipc) &&
+                    (d_opcode != OpcodeJal);
+  wire d_uses_rs2_in_x = (d_opcode == OpcodeRegReg) || (d_opcode == OpcodeBranch);
+
+  wire load_use_stall = x_result_not_ready && (execute_state.rd != 5'd0) &&
+                        ((d_uses_rs1 && execute_state.rd == d_rs1) ||
+                         (d_uses_rs2_in_x && execute_state.rd == d_rs2));
+
+  assign load_use_bubble = load_use_stall && !div_stall;
+
   assign stall_f = load_use_stall || div_stall;
   assign stall_d = load_use_stall || div_stall;
   assign flush_d = x_redirect_valid;
-  assign flush_x = x_redirect_valid || (load_use_stall && !div_stall) || div_stall;
+  assign flush_x = x_redirect_valid;
+
+  // -- Execute stage latch --
+  always_ff @(posedge clk) begin
+    if (rst) begin
+      execute_state <= '{
+        pc: 0, insn: 0, cycle_status: CYCLE_RESET,
+        rs1_data: 0, rs2_data: 0, rs1: 0, rs2: 0, rd: 0,
+        imm_i_sext: 0, imm_s_sext: 0, imm_b_sext: 0, imm_j_sext: 0,
+        imm_shamt: 0
+      };
+    end else if (flush_x) begin
+      execute_state <= '{
+        pc: 0, insn: 0, cycle_status: CYCLE_TAKEN_BRANCH,
+        rs1_data: 0, rs2_data: 0, rs1: 0, rs2: 0, rd: 0,
+        imm_i_sext: 0, imm_s_sext: 0, imm_b_sext: 0, imm_j_sext: 0,
+        imm_shamt: 0
+      };
+    end else if (div_stall) begin
+      execute_state.rs1_data <= x_rs1_fwd;
+      execute_state.rs2_data <= x_rs2_fwd;
+    end else if (load_use_bubble) begin
+      execute_state <= '{
+        pc: 0, insn: 0, cycle_status: CYCLE_LOAD2USE,
+        rs1_data: 0, rs2_data: 0, rs1: 0, rs2: 0, rd: 0,
+        imm_i_sext: 0, imm_s_sext: 0, imm_b_sext: 0, imm_j_sext: 0,
+        imm_shamt: 0
+      };
+    end else begin
+      execute_state <= '{
+        pc:           decode_state.pc,
+        insn:         decode_state.insn,
+        cycle_status: decode_state.cycle_status,
+        rs1_data:     d_rs1_data,
+        rs2_data:     d_rs2_data,
+        rs1:          d_rs1,
+        rs2:          d_rs2,
+        rd:           d_rd,
+        imm_i_sext:   d_imm_i_sext,
+        imm_s_sext:   d_imm_s_sext,
+        imm_b_sext:   d_imm_b_sext,
+        imm_j_sext:   d_imm_j_sext,
+        imm_shamt:    d_imm_shamt
+      };
+    end
+  end
+
+  wire [255:0] x_disasm;
+  Disasm #(.PREFIX("X")) disasm_2execute (.insn(execute_state.insn), .disasm(x_disasm));
 
   // =============================================================
-  //  MEMORY STAGE
+  //  MEMORY
   // =============================================================
   stage_memory_t memory_state;
   always_ff @(posedge clk) begin
     if (rst) begin
       memory_state <= '{
         pc: 0, insn: 0, cycle_status: CYCLE_RESET,
+        alu_result: 0, rs2_data: 0, rd: 0, rf_we: 0, halt: 0
+      };
+    end else if (div_stall) begin
+      memory_state <= '{
+        pc: 0, insn: 0, cycle_status: CYCLE_DIV,
         alu_result: 0, rs2_data: 0, rd: 0, rf_we: 0, halt: 0
       };
     end else begin
@@ -572,14 +644,12 @@ module DatapathPipelined (
         alu_result:   x_alu_result,
         rs2_data:     x_store_data,
         rd:           execute_state.rd,
-        // suppress write enable while stalling (div or load-use bubble)
-        rf_we:        x_rf_we && !div_stall,
-        halt:         x_halt  && !div_stall
+        rf_we:        x_rf_we,
+        halt:         x_halt
       };
     end
   end
 
-  // Expose for MX bypass
   assign m_rf_we      = memory_state.rf_we;
   assign m_rd         = memory_state.rd;
   assign m_alu_result = memory_state.alu_result;
@@ -590,7 +660,12 @@ module DatapathPipelined (
   wire [`OPCODE_SIZE] m_opcode = memory_state.insn[6:0];
   wire [ 2:0]         m_funct3 = memory_state.insn[14:12];
 
-  // Memory access
+  // WM bypass: forward writeback data to store data when applicable
+  wire [4:0] m_rs2_reg = memory_state.insn[24:20];
+  wire wm_bypass_valid = (m_opcode == OpcodeStore) && wb_rf_we &&
+                         (wb_rd != 5'd0) && (wb_rd == m_rs2_reg);
+  wire [`REG_SIZE] m_store_data = wm_bypass_valid ? wb_rd_data : memory_state.rs2_data;
+
   logic [`REG_SIZE] m_rd_data;
   always_comb begin
     addr_to_dmem       = {memory_state.alu_result[31:2], 2'b00};
@@ -602,22 +677,22 @@ module DatapathPipelined (
       case (m_funct3)
         3'b000: begin
           case (memory_state.alu_result[1:0])
-            2'b00: begin store_data_to_dmem={24'd0,memory_state.rs2_data[7:0]};       store_we_to_dmem=4'b0001; end
-            2'b01: begin store_data_to_dmem={16'd0,memory_state.rs2_data[7:0],8'd0};  store_we_to_dmem=4'b0010; end
-            2'b10: begin store_data_to_dmem={8'd0,memory_state.rs2_data[7:0],16'd0};  store_we_to_dmem=4'b0100; end
-            2'b11: begin store_data_to_dmem={memory_state.rs2_data[7:0],24'd0};       store_we_to_dmem=4'b1000; end
+            2'b00: begin store_data_to_dmem={24'd0,m_store_data[7:0]};       store_we_to_dmem=4'b0001; end
+            2'b01: begin store_data_to_dmem={16'd0,m_store_data[7:0],8'd0};  store_we_to_dmem=4'b0010; end
+            2'b10: begin store_data_to_dmem={8'd0,m_store_data[7:0],16'd0};  store_we_to_dmem=4'b0100; end
+            2'b11: begin store_data_to_dmem={m_store_data[7:0],24'd0};       store_we_to_dmem=4'b1000; end
             default: store_we_to_dmem=4'b0000;
           endcase
         end
         3'b001: begin
           case (memory_state.alu_result[1])
-            1'b0: begin store_data_to_dmem={16'd0,memory_state.rs2_data[15:0]};  store_we_to_dmem=4'b0011; end
-            1'b1: begin store_data_to_dmem={memory_state.rs2_data[15:0],16'd0};  store_we_to_dmem=4'b1100; end
+            1'b0: begin store_data_to_dmem={16'd0,m_store_data[15:0]};  store_we_to_dmem=4'b0011; end
+            1'b1: begin store_data_to_dmem={m_store_data[15:0],16'd0};  store_we_to_dmem=4'b1100; end
             default: store_we_to_dmem=4'b0000;
           endcase
         end
         3'b010: begin
-          store_data_to_dmem=memory_state.rs2_data; store_we_to_dmem=4'b1111;
+          store_data_to_dmem=m_store_data; store_we_to_dmem=4'b1111;
         end
         default: store_we_to_dmem=4'b0000;
       endcase
@@ -662,7 +737,7 @@ module DatapathPipelined (
   end
 
   // =============================================================
-  //  WRITEBACK STAGE
+  //  WRITEBACK
   // =============================================================
   stage_writeback_t writeback_state;
   always_ff @(posedge clk) begin
@@ -687,7 +762,6 @@ module DatapathPipelined (
   wire [255:0] w_disasm;
   Disasm #(.PREFIX("W")) disasm_4wb (.insn(writeback_state.insn), .disasm(w_disasm));
 
-  // WB → register file
   assign wb_rf_we   = writeback_state.rf_we;
   assign wb_rd      = writeback_state.rd;
   assign wb_rd_data = writeback_state.rd_data;
@@ -698,7 +772,6 @@ module DatapathPipelined (
   assign trace_writeback_insn         = writeback_state.insn;
   assign trace_writeback_cycle_status = writeback_state.cycle_status;
 
-  // Aliases used by the autograder testbench (dut.datapath.trace_completed_*)
   wire [`REG_SIZE]  trace_completed_pc           = writeback_state.pc;
   wire [`INSN_SIZE] trace_completed_insn         = writeback_state.insn;
   cycle_status_e    trace_completed_cycle_status;
@@ -759,7 +832,7 @@ module Processor (
   wire [`INSN_SIZE] insn_from_imem;
   wire [`REG_SIZE]  pc_to_imem, mem_data_addr, mem_data_loaded_value, mem_data_to_write;
   wire [3:0]        mem_data_we;
-  wire [(8*32)-1:0] test_case;  // driven by cocotb to label test in waveforms
+  wire [(8*32)-1:0] test_case;
 
   MemorySingleCycle #(.NUM_WORDS(8192)) memory (
       .rst(rst), .clk(clk),
